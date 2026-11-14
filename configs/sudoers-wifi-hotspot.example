@@ -1,0 +1,19 @@
+# ==============================================================================
+# /etc/sudoers.d/wifi-hotspot
+# Least-Privilege Sudoers Rule for KDE Plasma 6 Hotspot Panel Applet
+# ==============================================================================
+# Enables the active desktop user or wheel group members to invoke the
+# wifi-hotspot daemon without an interactive password prompt.
+#
+# This allows the unprivileged KDE Plasma QML process (running as your user)
+# to start, stop, toggle, and query credentials via the Executable DataSource.
+#
+# Deploy with:
+#   sudo install -m 0440 configs/sudoers-wifi-hotspot.example /etc/sudoers.d/wifi-hotspot
+# ==============================================================================
+
+# Option A: Allow all members of the 'wheel' administration group
+%wheel ALL=(ALL) NOPASSWD: /usr/local/bin/wifi-hotspot
+
+# Option B: Allow specific desktop user only (uncomment and replace $USER)
+# username ALL=(ALL) NOPASSWD: /usr/local/bin/wifi-hotspot

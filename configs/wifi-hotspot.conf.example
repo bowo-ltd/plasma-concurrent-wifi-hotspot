@@ -1,0 +1,38 @@
+# ==============================================================================
+# /etc/wifi-hotspot.conf
+# Configuration for Linux Concurrent Wi-Fi Hotspot & KDE Plasma 6 Panel Applet
+# ==============================================================================
+# This configuration file controls the physical/virtual interface topology,
+# network subnet, DHCP ranges, and concurrency fallback mode.
+# File permissions should strictly be 0600 (root:root) when deployed to /etc.
+# ==============================================================================
+
+# 1. Physical Wireless Interface (Upstream client connected to existing Wi-Fi)
+# Run 'iw dev' or 'ip link' to locate your active wireless device.
+UPSTREAM_IFACE="wlp4s0"
+
+# 2. Virtual AP Interface Name
+# Used in 'ap' mode when creating a virtual nl80211 interface alongside upstream.
+AP_IFACE="ap0"
+
+# 3. Access Point Credentials
+HOTSPOT_SSID="ArchLinux-Hotspot"
+HOTSPOT_PASS="SecurePassphrase2026!"
+
+# 4. Isolated Subnet & Gateway Configuration
+# Must NOT collide with your upstream Wi-Fi subnet (e.g. if upstream is 192.168.1.0/24).
+HOTSPOT_SUBNET="192.168.12.0/24"
+HOTSPOT_GW="192.168.12.1"
+DHCP_RANGE_START="192.168.12.50"
+DHCP_RANGE_END="192.168.12.150"
+
+# 5. Frequency & Operating Mode
+# Default fallback frequency (2437 MHz = Channel 6, 2412 MHz = Channel 1, 2422 MHz = Channel 3, 5180 MHz = Channel 36)
+P2P_CHANNEL_FREQ="2437"
+
+# Concurrency Modes:
+# - 'auto' : Probes hardware capabilities via nl80211; attempts virtual AP on the same
+#            carrier frequency first, falling back to P2P-GO multi-channel concurrency if supported.
+# - 'ap'   : Dedicated virtual AP interface (__ap) synchronized to upstream channel.
+# - 'p2p'  : Wi-Fi Direct P2P Group Owner mode (supports MCC/SCC across multi-channel drivers).
+HOTSPOT_MODE="auto"

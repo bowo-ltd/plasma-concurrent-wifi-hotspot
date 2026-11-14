@@ -1,0 +1,1070 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="/etc/wifi-hotspot.conf"
+RUN_DIR="/run/wifi-hotspot"
+LOCK_FILE="${RUN_DIR}/lock"
+STATE_FILE="${RUN_DIR}/state"
+PUBLIC_STATE_FILE="${RUN_DIR}/public_state"
+HOSTAPD_CONF="${RUN_DIR}/hostapd.conf"
+HOSTAPD_PID="${RUN_DIR}/hostapd.pid"
+HOSTAPD_LOG="${RUN_DIR}/hostapd.log"
+WPA_CONF="${RUN_DIR}/wpa_supplicant.conf"
+WPA_PID="${RUN_DIR}/wpa_supplicant.pid"
+WPA_LOG="${RUN_DIR}/wpa_supplicant.log"
+WPA_CTRL_SUBDIR="${RUN_DIR}/wpa_ctrl"
+DNSMASQ_CONF="${RUN_DIR}/dnsmasq.conf"
+DNSMASQ_PID="${RUN_DIR}/dnsmasq.pid"
+DNSMASQ_LEASES="${RUN_DIR}/dnsmasq.leases"
+DNSMASQ_LOG="${RUN_DIR}/dnsmasq.log"
+PREV_IP_FWD_FILE="${RUN_DIR}/prev_ip_forward"
+NFT_TABLE="wifi_hotspot"
+WPA_CTRL_DIR="/run/wpa_supplicant"
+
+rollback_needed=0
+
+die() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 1
+}
+
+require_root() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        die "root privileges are required (run with sudo)."
+    fi
+}
+
+cleanup_on_exit() {
+    local rc=$?
+    if [[ "${rollback_needed:-0}" -eq 1 ]]; then
+        internal_off >/dev/null 2>&1 || true
+    fi
+    exit "$rc"
+}
+
+acquire_lock() {
+    mkdir -p "$RUN_DIR"
+    chmod 755 "$RUN_DIR"
+    exec 9>"$LOCK_FILE"
+    flock -w 15 9 || die "failed to acquire lock ${LOCK_FILE}."
+}
+
+load_defaults() {
+    UPSTREAM_IFACE="wlp4s0"
+    AP_IFACE="ap0"
+    HOTSPOT_SSID="ArchHotspot"
+    HOTSPOT_PASS=""
+    HOTSPOT_SUBNET="192.168.12.0/24"
+    HOTSPOT_GW="192.168.12.1"
+    DHCP_RANGE_START="192.168.12.50"
+    DHCP_RANGE_END="192.168.12.150"
+    P2P_CHANNEL_FREQ="2437"
+    HOTSPOT_MODE="auto"
+}
+
+generate_random_pass() {
+    local pass="" chunk=""
+    while (( ${#pass} < 16 )); do
+        chunk="$(head -c 256 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' || true)"
+        pass+="$chunk"
+    done
+    printf '%s\n' "${pass:0:16}"
+}
+
+load_config_lenient() {
+    load_defaults
+    if [[ -f "$CONFIG_FILE" && -r "$CONFIG_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE" || true
+    fi
+    : "${UPSTREAM_IFACE:=wlp4s0}"
+    : "${AP_IFACE:=ap0}"
+    : "${HOTSPOT_SSID:=ArchHotspot}"
+    : "${HOTSPOT_MODE:=auto}"
+}
+
+load_config() {
+    load_defaults
+    if [[ -f "$CONFIG_FILE" ]]; then
+        [[ -r "$CONFIG_FILE" ]] || die "cannot read ${CONFIG_FILE}."
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+    fi
+
+    : "${UPSTREAM_IFACE:=wlp4s0}"
+    : "${AP_IFACE:=ap0}"
+    : "${HOTSPOT_SSID:=ArchHotspot}"
+    : "${HOTSPOT_SUBNET:=192.168.12.0/24}"
+    : "${HOTSPOT_GW:=192.168.12.1}"
+    : "${DHCP_RANGE_START:=192.168.12.50}"
+    : "${DHCP_RANGE_END:=192.168.12.150}"
+    : "${P2P_CHANNEL_FREQ:=2437}"
+    : "${HOTSPOT_MODE:=auto}"
+
+    if [[ -z "${HOTSPOT_PASS:-}" ]]; then
+        HOTSPOT_PASS="$(generate_random_pass)"
+    fi
+
+    validate_config
+}
+
+validate_ipv4() {
+    local ip="$1"
+    local IFS='.'
+    local -a octets
+    read -r -a octets <<< "$ip"
+    [[ ${#octets[@]} -eq 4 ]] || return 1
+    local o
+    for o in "${octets[@]}"; do
+        [[ "$o" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+        (( 10#$o >= 0 && 10#$o <= 255 )) || return 1
+    done
+    return 0
+}
+
+ipv4_to_int() {
+    local ip="$1"
+    local a b c d
+    IFS='.' read -r a b c d <<< "$ip"
+    printf '%u\n' $(( (10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d ))
+}
+
+validate_config() {
+    if [[ ! "$AP_IFACE" =~ ^[a-zA-Z0-9._-]+$ ]] || (( ${#AP_IFACE} < 1 || ${#AP_IFACE} > 15 )); then
+        die "AP_IFACE '${AP_IFACE}' must be a valid interface name (1..15 chars)."
+    fi
+    if [[ "$AP_IFACE" == "$UPSTREAM_IFACE" ]]; then
+        die "AP_IFACE must differ from UPSTREAM_IFACE ('${UPSTREAM_IFACE}')."
+    fi
+
+    local ssid_bytes
+    ssid_bytes=$(printf '%s' "$HOTSPOT_SSID" | wc -c)
+    if [[ "$HOTSPOT_SSID" == *$'\n'* ]] || (( ssid_bytes < 1 || ssid_bytes > 32 )); then
+        die "HOTSPOT_SSID must be 1..32 bytes without newlines."
+    fi
+    if [[ "$HOTSPOT_PASS" == *$'\n'* ]] || (( ${#HOTSPOT_PASS} < 8 || ${#HOTSPOT_PASS} > 63 )); then
+        die "HOTSPOT_PASS must be 8..63 characters without newlines."
+    fi
+    if LC_ALL=C grep -q '[^ -~]' <<< "$HOTSPOT_PASS"; then
+        die "HOTSPOT_PASS must contain only printable ASCII characters (32..126)."
+    fi
+
+    case "$HOTSPOT_MODE" in
+        auto|ap|p2p) ;;
+        *) die "HOTSPOT_MODE must be one of: auto, ap, p2p (got '${HOTSPOT_MODE}')." ;;
+    esac
+
+    if [[ ! "$HOTSPOT_SUBNET" =~ ^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/([0-9]+)$ ]]; then
+        die "invalid HOTSPOT_SUBNET '${HOTSPOT_SUBNET}'."
+    fi
+    local net_ip="${BASH_REMATCH[1]}"
+    local prefix="${BASH_REMATCH[2]}"
+    validate_ipv4 "$net_ip" || die "invalid IPv4 in HOTSPOT_SUBNET '${HOTSPOT_SUBNET}'."
+    [[ "$prefix" =~ ^(0|[1-9][0-9]*)$ ]] || die "invalid prefix in HOTSPOT_SUBNET '${HOTSPOT_SUBNET}'."
+    (( 10#$prefix >= 8 && 10#$prefix <= 30 )) || die "HOTSPOT_SUBNET prefix must be /8../30."
+
+    validate_ipv4 "$HOTSPOT_GW" || die "invalid HOTSPOT_GW '${HOTSPOT_GW}'."
+    validate_ipv4 "$DHCP_RANGE_START" || die "invalid DHCP_RANGE_START '${DHCP_RANGE_START}'."
+    validate_ipv4 "$DHCP_RANGE_END" || die "invalid DHCP_RANGE_END '${DHCP_RANGE_END}'."
+
+    local mask net_int net_base bcast gw_int start_int end_int
+    mask=$(( (0xffffffff << (32 - 10#$prefix)) & 0xffffffff ))
+    net_int="$(ipv4_to_int "$net_ip")"
+    net_base=$(( net_int & mask ))
+    bcast=$(( net_base | (~mask & 0xffffffff) ))
+    gw_int="$(ipv4_to_int "$HOTSPOT_GW")"
+    start_int="$(ipv4_to_int "$DHCP_RANGE_START")"
+    end_int="$(ipv4_to_int "$DHCP_RANGE_END")"
+
+    (( (gw_int & mask) == net_base && gw_int > net_base && gw_int < bcast )) || \
+        die "HOTSPOT_GW '${HOTSPOT_GW}' must be a host address inside '${HOTSPOT_SUBNET}'."
+    (( (start_int & mask) == net_base && start_int > net_base && start_int < bcast )) || \
+        die "DHCP_RANGE_START '${DHCP_RANGE_START}' must be inside '${HOTSPOT_SUBNET}'."
+    (( (end_int & mask) == net_base && end_int > net_base && end_int < bcast )) || \
+        die "DHCP_RANGE_END '${DHCP_RANGE_END}' must be inside '${HOTSPOT_SUBNET}'."
+    (( start_int <= end_int )) || \
+        die "DHCP_RANGE_START '${DHCP_RANGE_START}' must be <= DHCP_RANGE_END '${DHCP_RANGE_END}'."
+    (( gw_int < start_int || gw_int > end_int )) || \
+        die "HOTSPOT_GW '${HOTSPOT_GW}' must not overlap DHCP range ${DHCP_RANGE_START}-${DHCP_RANGE_END}."
+
+    [[ "$P2P_CHANNEL_FREQ" =~ ^[0-9]+$ ]] || die "invalid P2P_CHANNEL_FREQ '${P2P_CHANNEL_FREQ}'."
+    if (( P2P_CHANNEL_FREQ < 2412 || P2P_CHANNEL_FREQ > 2472 || (P2P_CHANNEL_FREQ - 2407) % 5 != 0 )); then
+        die "P2P_CHANNEL_FREQ '${P2P_CHANNEL_FREQ}' must be a valid 2.4 GHz channel frequency (2412..2472 MHz, e.g., 2437)."
+    fi
+}
+
+prefix_to_netmask() {
+    local prefix="$1"
+    local mask=$(( (0xffffffff << (32 - 10#$prefix)) & 0xffffffff ))
+    printf '%d.%d.%d.%d\n' \
+        $(( (mask >> 24) & 0xff )) \
+        $(( (mask >> 16) & 0xff )) \
+        $(( (mask >> 8) & 0xff )) \
+        $(( mask & 0xff ))
+}
+
+freq_to_channel() {
+    local freq="$1"
+    if (( freq >= 2412 && freq <= 2472 )); then
+        printf '%d\n' $(( (freq - 2407) / 5 ))
+    elif (( freq == 2484 )); then
+        printf '14\n'
+    elif (( freq >= 5000 && freq <= 5900 )); then
+        printf '%d\n' $(( (freq - 5000) / 5 ))
+    else
+        printf '0\n'
+    fi
+}
+
+get_iface_info() {
+    local iface="$1"
+    iw dev "$iface" info 2>/dev/null || return 1
+}
+
+get_upstream_wiphy() {
+    local info="$1"
+    awk '/^[[:space:]]*wiphy[[:space:]]+/ { print $2; exit }' <<< "$info"
+}
+
+get_upstream_freq_and_channel() {
+    local info="$1"
+    awk '/^[[:space:]]*channel[[:space:]]+/ {
+        ch=$2
+        gsub(/[()]/, "", $3)
+        freq=$3
+        print freq, ch
+        exit
+    }' <<< "$info"
+}
+
+find_p2p_ifaces() {
+    local d
+    for d in /sys/class/net/p2p-"${UPSTREAM_IFACE}"-*; do
+        [[ -e "$d" ]] || continue
+        basename "$d"
+    done
+}
+
+check_wifi_radio() {
+    if command -v nmcli >/dev/null 2>&1; then
+        local radio
+        radio="$(nmcli radio wifi 2>/dev/null || true)"
+        if [[ "$radio" == "disabled" ]]; then
+            die "Wi-Fi radio is disabled in NetworkManager (run 'nmcli radio wifi on' first)."
+        fi
+    fi
+    local rf_dir
+    for rf_dir in /sys/class/rfkill/rfkill*; do
+        [[ -r "${rf_dir}/type" ]] || continue
+        if [[ "$(<"${rf_dir}/type")" == "wlan" ]]; then
+            if [[ "$(<"${rf_dir}/hard")" == "1" ]]; then
+                die "Wi-Fi is hardware-blocked by rfkill."
+            fi
+            if [[ "$(<"${rf_dir}/soft")" == "1" ]]; then
+                die "Wi-Fi is software-blocked by rfkill."
+            fi
+        fi
+    done
+}
+
+pick_ap_mac() {
+    local wiphy="$1"
+    local upstream="$2"
+    local used_macs=""
+    local addr_file
+    for addr_file in /sys/class/net/*/address; do
+        [[ -r "$addr_file" ]] || continue
+        used_macs+=$'\n'"$(tr '[:upper:]' '[:lower:]' < "$addr_file")"
+    done
+    used_macs+=$'\n'"$(iw dev 2>/dev/null | awk '/^[[:space:]]*addr[[:space:]]+/ { print tolower($2) }')"
+
+    local pool_file="/sys/class/ieee80211/phy${wiphy}/addresses"
+    if [[ -r "$pool_file" ]]; then
+        local candidate
+        while IFS= read -r candidate; do
+            candidate="${candidate,,}"
+            [[ "$candidate" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || continue
+            if ! grep -Fqx "$candidate" <<< "$used_macs"; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        done < "$pool_file"
+    fi
+
+    # Fallback: locally administered MAC derived from upstream MAC
+    local base_mac=""
+    if [[ -r "/sys/class/net/${upstream}/address" ]]; then
+        base_mac="$(tr '[:upper:]' '[:lower:]' < "/sys/class/net/${upstream}/address")"
+    fi
+    if [[ ! "$base_mac" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]; then
+        base_mac="02:00:00:00:12:01"
+    fi
+    local b1 b2 b3 b4 b5 b6
+    IFS=':' read -r b1 b2 b3 b4 b5 b6 <<< "$base_mac"
+    local first=$(( (0x${b1} | 0x02) & 0xfe ))
+    local last=$(( 0x${b6} ))
+    local offset
+    for ((offset = 1; offset <= 254; offset++)); do
+        local cand
+        cand=$(printf '%02x:%s:%s:%s:%s:%02x' "$first" "$b2" "$b3" "$b4" "$b5" $(( (last + offset) & 0xff )))
+        if ! grep -Fqx "$cand" <<< "$used_macs"; then
+            printf '%s\n' "$cand"
+            return 0
+        fi
+    done
+    die "unable to allocate unique MAC address for ${AP_IFACE}."
+}
+
+kill_pid_file() {
+    local pidfile="$1"
+    local expected="$2"
+    [[ -f "$pidfile" ]] || return 0
+    local pid
+    pid="$(<"$pidfile")"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+        local comm=""
+        [[ -r "/proc/${pid}/comm" ]] && comm="$(<"/proc/${pid}/comm")"
+        if [[ -z "$expected" || "$comm" == "$expected" ]]; then
+            kill -TERM "$pid" 2>/dev/null || true
+            local i
+            for ((i = 0; i < 30; i++)); do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 0.1
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -KILL "$pid" 2>/dev/null || true
+            fi
+        fi
+    fi
+    rm -f "$pidfile"
+}
+
+is_pid_running() {
+    local pidfile="$1"
+    local expected="$2"
+    [[ -r "$pidfile" ]] || return 1
+    local pid
+    pid="$(<"$pidfile")"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    if [[ "${EUID}" -eq 0 ]]; then
+        kill -0 "$pid" 2>/dev/null || return 1
+    else
+        [[ -d "/proc/${pid}" ]] || return 1
+    fi
+    if [[ -n "$expected" && -r "/proc/${pid}/comm" ]]; then
+        [[ "$(<"/proc/${pid}/comm")" == "$expected" ]] || return 1
+    fi
+    return 0
+}
+
+is_hotspot_active() {
+    local sf="$STATE_FILE"
+    if [[ "${EUID}" -ne 0 ]]; then
+        sf="$PUBLIC_STATE_FILE"
+    fi
+    if [[ -r "$sf" ]]; then
+        local active_mode="" hotspot_iface=""
+        # shellcheck source=/dev/null
+        source "$sf"
+        active_mode="${ACTIVE_MODE:-}"
+        hotspot_iface="${HOTSPOT_IFACE:-}"
+        if [[ "$active_mode" == "ap" ]]; then
+            is_pid_running "$HOSTAPD_PID" "hostapd" && [[ -d "/sys/class/net/${hotspot_iface}" ]] && return 0
+        elif [[ "$active_mode" == "p2p" ]]; then
+            is_pid_running "$WPA_PID" "wpa_supplicant" && [[ -d "/sys/class/net/${hotspot_iface}" ]] && return 0
+        fi
+    fi
+    return 1
+}
+
+clean_docker_user_rules() {
+    local iface
+    command -v iptables >/dev/null 2>&1 || return 0
+    iptables -S DOCKER-USER >/dev/null 2>&1 || return 0
+    for iface in "$@"; do
+        [[ -n "$iface" ]] || continue
+        while iptables -D DOCKER-USER -i "$iface" -m comment --comment "wifi-hotspot" -j ACCEPT 2>/dev/null; do :; done
+        while iptables -D DOCKER-USER -o "$iface" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "wifi-hotspot" -j ACCEPT 2>/dev/null; do :; done
+    done
+}
+
+internal_off() {
+    local state_iface="" state_mode=""
+    if [[ -r "$STATE_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$STATE_FILE" || true
+        state_iface="${HOTSPOT_IFACE:-}"
+        state_mode="${ACTIVE_MODE:-}"
+    fi
+
+    kill_pid_file "$DNSMASQ_PID" "dnsmasq"
+    kill_pid_file "$HOSTAPD_PID" "hostapd"
+    kill_pid_file "$WPA_PID" "wpa_supplicant"
+
+    clean_docker_user_rules "$state_iface" "$AP_IFACE"
+
+    if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+        nft delete table inet "$NFT_TABLE" || true
+    fi
+
+    if [[ -r "$PREV_IP_FWD_FILE" ]]; then
+        local prev_fwd
+        prev_fwd="$(<"$PREV_IP_FWD_FILE")"
+        if [[ "$prev_fwd" == "0" || "$prev_fwd" == "1" ]]; then
+            sysctl -q -w "net.ipv4.ip_forward=${prev_fwd}" || true
+        fi
+    fi
+
+    # Clean up any legacy NM-managed p2p-* netdevs if present
+    local p2p_dev="p2p-dev-${UPSTREAM_IFACE}"
+    local p2p_if
+    for p2p_if in $(find_p2p_ifaces) $([[ "$state_mode" == "p2p" && -n "$state_iface" && "$state_iface" != "$AP_IFACE" ]] && printf '%s\n' "$state_iface" || true); do
+        [[ -n "$p2p_if" && -e "/sys/class/net/${p2p_if}" ]] || continue
+        if [[ -S "${WPA_CTRL_DIR}/${p2p_dev}" ]]; then
+            wpa_cli 9>&- -p "$WPA_CTRL_DIR" -i "$p2p_dev" p2p_group_remove "$p2p_if" >/dev/null 2>&1 || true
+        fi
+        local i
+        for ((i = 0; i < 20; i++)); do
+            [[ -e "/sys/class/net/${p2p_if}" ]] || break
+            sleep 0.1
+        done
+        if [[ -e "/sys/class/net/${p2p_if}" ]]; then
+            ip link set "$p2p_if" down >/dev/null 2>&1 || true
+            iw dev "$p2p_if" del >/dev/null 2>&1 || true
+        fi
+    done
+
+    local iface_del
+    for iface_del in "$AP_IFACE" "$state_iface"; do
+        [[ -n "$iface_del" && "$iface_del" != "$UPSTREAM_IFACE" ]] || continue
+        if iw dev "$iface_del" info >/dev/null 2>&1 || [[ -e "/sys/class/net/${iface_del}" ]]; then
+            ip link set "$iface_del" down >/dev/null 2>&1 || true
+            iw dev "$iface_del" del >/dev/null 2>&1 || true
+        fi
+    done
+
+    rm -rf "$WPA_CTRL_SUBDIR"
+    rm -f "$STATE_FILE" "${STATE_FILE}.tmp" "$PUBLIC_STATE_FILE" "${PUBLIC_STATE_FILE}.tmp" \
+          "$HOSTAPD_CONF" "$HOSTAPD_PID" "$HOSTAPD_LOG" \
+          "$WPA_CONF" "$WPA_PID" "$WPA_LOG" \
+          "$DNSMASQ_CONF" "$DNSMASQ_PID" "$DNSMASQ_LEASES" "$DNSMASQ_LOG" \
+          "$PREV_IP_FWD_FILE"
+}
+
+start_ap_mode() {
+    local wiphy="$1"
+    local channel="$2"
+    local freq="$3"
+    local ap_mac
+
+    ap_mac="$(pick_ap_mac "$wiphy" "$UPSTREAM_IFACE")"
+    iw dev "$UPSTREAM_IFACE" interface add "$AP_IFACE" type __ap addr "$ap_mac"
+
+    umask 077
+    cat > "$HOSTAPD_CONF" <<CONF
+interface=${AP_IFACE}
+driver=nl80211
+ssid=${HOTSPOT_SSID}
+hw_mode=g
+channel=${channel}
+ieee80211n=1
+wmm_enabled=1
+auth_algs=1
+ignore_broadcast_ssid=0
+wpa=2
+wpa_passphrase=${HOTSPOT_PASS}
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+CONF
+    chmod 600 "$HOSTAPD_CONF"
+    umask 022
+
+    : > "$HOSTAPD_LOG"
+    chmod 600 "$HOSTAPD_LOG"
+    if ! hostapd -B -P "$HOSTAPD_PID" "$HOSTAPD_CONF" >"$HOSTAPD_LOG" 2>&1 9>&-; then
+        cat "$HOSTAPD_LOG" >&2 || true
+        die "hostapd failed to start on ${AP_IFACE} (channel ${channel}, ${freq} MHz)."
+    fi
+
+    local i ready=0
+    for ((i = 0; i < 30; i++)); do
+        if ! is_pid_running "$HOSTAPD_PID" "hostapd"; then
+            cat "$HOSTAPD_LOG" >&2 || true
+            die "hostapd exited prematurely on ${AP_IFACE}."
+        fi
+        if iw dev "$AP_IFACE" info 2>/dev/null | grep -qE '^[[:space:]]*type AP$'; then
+            ready=1
+            break
+        fi
+        sleep 0.1
+    done
+    if [[ "$ready" -ne 1 ]]; then
+        cat "$HOSTAPD_LOG" >&2 || true
+        die "timed out waiting for ${AP_IFACE} to enter AP mode."
+    fi
+
+    ACTIVE_MODE="ap"
+    HOTSPOT_IFACE="$AP_IFACE"
+    HOTSPOT_SSID_ACTIVE="$HOTSPOT_SSID"
+    HOTSPOT_PASS_ACTIVE="$HOTSPOT_PASS"
+    ACTIVE_CHANNEL="$channel"
+    ACTIVE_FREQ="$freq"
+}
+
+start_p2p_mode() {
+    local wiphy="$1"
+    local target_freq="$2"
+    local ap_mac ssid_hex psk_hex
+
+    ap_mac="$(pick_ap_mac "$wiphy" "$UPSTREAM_IFACE")"
+    # Create unmanaged AP interface first, then run standalone wpa_supplicant (no -u D-Bus)
+    # in mode=3 (P2P-GO). Starting as __ap keeps wpa_supplicant drv_init from switching to
+    # STATION (which would collide with wlp4s0 under #{ managed } <= 1) and avoids
+    # NetworkManager D-Bus RemoveInterface teardown on GroupStarted.
+    iw dev "$UPSTREAM_IFACE" interface add "$AP_IFACE" type __ap addr "$ap_mac"
+
+    ssid_hex="$(printf '%s' "$HOTSPOT_SSID" | od -An -tx1 -v | tr -d ' \n')"
+    psk_hex="$(wpa_passphrase "$HOTSPOT_SSID" "$HOTSPOT_PASS" | awk -F= '/^[[:space:]]*psk=/{print $2; exit}')"
+    [[ "$psk_hex" =~ ^[0-9a-fA-F]{64}$ ]] || die "failed to derive WPA2 PSK for P2P-GO mode."
+
+    mkdir -p "$WPA_CTRL_SUBDIR"
+    chmod 700 "$WPA_CTRL_SUBDIR"
+
+    umask 077
+    cat > "$WPA_CONF" <<CONF
+ctrl_interface=${WPA_CTRL_SUBDIR}
+ap_scan=2
+p2p_disabled=1
+network={
+    ssid=${ssid_hex}
+    mode=3
+    frequency=${target_freq}
+    proto=RSN
+    key_mgmt=WPA-PSK
+    pairwise=CCMP
+    group=CCMP
+    psk=${psk_hex}
+}
+CONF
+    chmod 600 "$WPA_CONF"
+    umask 022
+
+    : > "$WPA_LOG"
+    chmod 600 "$WPA_LOG"
+    if ! wpa_supplicant -B -P "$WPA_PID" -i "$AP_IFACE" -D nl80211 -c "$WPA_CONF" -f "$WPA_LOG" >/dev/null 2>&1 9>&-; then
+        cat "$WPA_LOG" >&2 || true
+        die "wpa_supplicant (P2P-GO) failed to start on ${AP_IFACE} (${target_freq} MHz)."
+    fi
+
+    local i ready=0
+    for ((i = 0; i < 30; i++)); do
+        if ! is_pid_running "$WPA_PID" "wpa_supplicant"; then
+            cat "$WPA_LOG" >&2 || true
+            die "wpa_supplicant (P2P-GO) exited prematurely on ${AP_IFACE}."
+        fi
+        if iw dev "$AP_IFACE" info 2>/dev/null | grep -qE '^[[:space:]]*type P2P-GO$'; then
+            local st
+            st="$(wpa_cli 9>&- -p "$WPA_CTRL_SUBDIR" -i "$AP_IFACE" status 2>/dev/null || true)"
+            if grep -q '^wpa_state=COMPLETED$' <<< "$st"; then
+                chmod 644 "$WPA_PID" 2>/dev/null || true
+                ready=1
+                break
+            fi
+        fi
+        sleep 0.1
+    done
+    if [[ "$ready" -ne 1 ]]; then
+        cat "$WPA_LOG" >&2 || true
+        die "timed out waiting for ${AP_IFACE} to enter P2P-GO mode."
+    fi
+
+    local final_status active_freq
+    final_status="$(wpa_cli 9>&- -p "$WPA_CTRL_SUBDIR" -i "$AP_IFACE" status 2>/dev/null || true)"
+    active_freq="$(awk -F= '/^freq=/{print $2; exit}' <<< "$final_status")"
+    if [[ -z "$active_freq" || ! "$active_freq" =~ ^[0-9]+$ ]]; then
+        active_freq="$target_freq"
+    fi
+
+    ACTIVE_MODE="p2p"
+    HOTSPOT_IFACE="$AP_IFACE"
+    HOTSPOT_SSID_ACTIVE="$HOTSPOT_SSID"
+    HOTSPOT_PASS_ACTIVE="$HOTSPOT_PASS"
+    ACTIVE_FREQ="$active_freq"
+    ACTIVE_CHANNEL="$(freq_to_channel "$active_freq")"
+}
+
+configure_network_services() {
+    local prefix="${HOTSPOT_SUBNET#*/}"
+    local netmask
+    netmask="$(prefix_to_netmask "$prefix")"
+
+    ip link set "$HOTSPOT_IFACE" up
+    ip addr replace "${HOTSPOT_GW}/${prefix}" dev "$HOTSPOT_IFACE"
+
+    # Briefly ensure interface stays configured if NetworkManager emits an event
+    sleep 0.2
+    if ! ip -4 -o addr show dev "$HOTSPOT_IFACE" | grep -qF "${HOTSPOT_GW}/${prefix}"; then
+        ip addr replace "${HOTSPOT_GW}/${prefix}" dev "$HOTSPOT_IFACE"
+    fi
+
+    : > "$DNSMASQ_LEASES"
+    : > "$DNSMASQ_LOG"
+    chown dnsmasq:dnsmasq "$DNSMASQ_LEASES" "$DNSMASQ_LOG"
+    chmod 644 "$DNSMASQ_LEASES" "$DNSMASQ_LOG"
+
+    cat > "$DNSMASQ_CONF" <<CONF
+interface=${HOTSPOT_IFACE}
+listen-address=${HOTSPOT_GW}
+bind-interfaces
+except-interface=lo
+user=dnsmasq
+group=dnsmasq
+dhcp-authoritative
+dhcp-range=${DHCP_RANGE_START},${DHCP_RANGE_END},${netmask},12h
+dhcp-option=option:router,${HOTSPOT_GW}
+dhcp-option=option:dns-server,${HOTSPOT_GW}
+dhcp-leasefile=${DNSMASQ_LEASES}
+pid-file=${DNSMASQ_PID}
+log-facility=${DNSMASQ_LOG}
+CONF
+    chmod 644 "$DNSMASQ_CONF"
+
+    if ! dnsmasq --conf-file="$DNSMASQ_CONF" 9>&-; then
+        cat "$DNSMASQ_LOG" >&2 || true
+        die "dnsmasq failed to start on ${HOTSPOT_IFACE}."
+    fi
+
+    local i
+    for ((i = 0; i < 20; i++)); do
+        is_pid_running "$DNSMASQ_PID" "dnsmasq" && break
+        sleep 0.1
+    done
+    if ! is_pid_running "$DNSMASQ_PID" "dnsmasq"; then
+        cat "$DNSMASQ_LOG" >&2 || true
+        die "dnsmasq exited unexpectedly."
+    fi
+
+    if [[ ! -f "$PREV_IP_FWD_FILE" ]]; then
+        printf '%s\n' "$(</proc/sys/net/ipv4/ip_forward)" > "$PREV_IP_FWD_FILE"
+        chmod 600 "$PREV_IP_FWD_FILE"
+    fi
+    sysctl -q -w net.ipv4.ip_forward=1
+
+    nft -f - <<NFT
+table inet ${NFT_TABLE}
+delete table inet ${NFT_TABLE}
+table inet ${NFT_TABLE} {
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+        iifname "${HOTSPOT_IFACE}" accept
+        oifname "${HOTSPOT_IFACE}" ct state established,related accept
+    }
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip saddr ${HOTSPOT_SUBNET} oifname != "${HOTSPOT_IFACE}" masquerade
+    }
+}
+NFT
+
+    # Cooperate cleanly if Docker is active and sets ip filter FORWARD policy to DROP
+    if command -v iptables >/dev/null 2>&1 && iptables -S DOCKER-USER >/dev/null 2>&1; then
+        iptables -C DOCKER-USER -o "$HOTSPOT_IFACE" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "wifi-hotspot" -j ACCEPT 2>/dev/null || \
+            iptables -I DOCKER-USER 1 -o "$HOTSPOT_IFACE" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "wifi-hotspot" -j ACCEPT
+        iptables -C DOCKER-USER -i "$HOTSPOT_IFACE" -m comment --comment "wifi-hotspot" -j ACCEPT 2>/dev/null || \
+            iptables -I DOCKER-USER 1 -i "$HOTSPOT_IFACE" -m comment --comment "wifi-hotspot" -j ACCEPT
+    elif command -v iptables >/dev/null 2>&1 && iptables -S FORWARD 2>/dev/null | grep -q '^-P FORWARD DROP$'; then
+        printf 'Warning: iptables FORWARD policy is DROP; ensure forwarding for %s is allowed.\n' "$HOTSPOT_IFACE" >&2
+    fi
+
+    # Final liveness verification of the AP/P2P-GO daemon after network setup
+    if [[ "$ACTIVE_MODE" == "ap" ]]; then
+        is_pid_running "$HOSTAPD_PID" "hostapd" || die "hostapd stopped during network setup."
+    else
+        is_pid_running "$WPA_PID" "wpa_supplicant" || die "wpa_supplicant (P2P-GO) stopped during network setup."
+    fi
+}
+
+write_state_file() {
+    local tmp_state="${STATE_FILE}.tmp"
+    umask 077
+    {
+        printf 'HOTSPOT_ACTIVE=%q\n' "1"
+        printf 'ACTIVE_MODE=%q\n' "$ACTIVE_MODE"
+        printf 'HOTSPOT_IFACE=%q\n' "$HOTSPOT_IFACE"
+        printf 'HOTSPOT_SSID_ACTIVE=%q\n' "$HOTSPOT_SSID_ACTIVE"
+        printf 'HOTSPOT_PASS_ACTIVE=%q\n' "$HOTSPOT_PASS_ACTIVE"
+        printf 'ACTIVE_CHANNEL=%q\n' "$ACTIVE_CHANNEL"
+        printf 'ACTIVE_FREQ=%q\n' "$ACTIVE_FREQ"
+        printf 'HOTSPOT_GW_ACTIVE=%q\n' "$HOTSPOT_GW"
+        printf 'HOTSPOT_SUBNET_ACTIVE=%q\n' "$HOTSPOT_SUBNET"
+        printf 'DHCP_RANGE_ACTIVE=%q\n' "${DHCP_RANGE_START} - ${DHCP_RANGE_END}"
+        printf 'UPSTREAM_IFACE_ACTIVE=%q\n' "$UPSTREAM_IFACE"
+        printf 'STARTED_AT=%q\n' "$(date -Iseconds)"
+    } > "$tmp_state"
+    chmod 600 "$tmp_state"
+    mv -f "$tmp_state" "$STATE_FILE"
+
+    local tmp_pub="${PUBLIC_STATE_FILE}.tmp"
+    umask 022
+    {
+        printf 'HOTSPOT_ACTIVE=%q\n' "1"
+        printf 'ACTIVE_MODE=%q\n' "$ACTIVE_MODE"
+        printf 'HOTSPOT_IFACE=%q\n' "$HOTSPOT_IFACE"
+        printf 'HOTSPOT_SSID_ACTIVE=%q\n' "$HOTSPOT_SSID_ACTIVE"
+        printf 'ACTIVE_CHANNEL=%q\n' "$ACTIVE_CHANNEL"
+        printf 'ACTIVE_FREQ=%q\n' "$ACTIVE_FREQ"
+        printf 'HOTSPOT_GW_ACTIVE=%q\n' "$HOTSPOT_GW"
+        printf 'HOTSPOT_SUBNET_ACTIVE=%q\n' "$HOTSPOT_SUBNET"
+        printf 'DHCP_RANGE_ACTIVE=%q\n' "${DHCP_RANGE_START} - ${DHCP_RANGE_END}"
+        printf 'UPSTREAM_IFACE_ACTIVE=%q\n' "$UPSTREAM_IFACE"
+        printf 'STARTED_AT=%q\n' "$(date -Iseconds)"
+    } > "$tmp_pub"
+    chmod 644 "$tmp_pub"
+    mv -f "$tmp_pub" "$PUBLIC_STATE_FILE"
+}
+
+count_clients() {
+    local iface="$1"
+    if [[ -n "$iface" && -e "/sys/class/net/${iface}" ]]; then
+        iw dev "$iface" station dump 2>/dev/null | grep -c '^Station ' || true
+    else
+        printf '0\n'
+    fi
+}
+
+print_status_porcelain() {
+    if is_hotspot_active; then
+        local sf="$STATE_FILE"
+        if [[ "${EUID}" -ne 0 ]]; then
+            sf="$PUBLIC_STATE_FILE"
+        fi
+        # shellcheck source=/dev/null
+        source "$sf"
+        local clients
+        clients="$(count_clients "${HOTSPOT_IFACE:-}")"
+        printf 'HOTSPOT_ACTIVE=1\n'
+        printf 'ACTIVE_MODE=%s\n' "${ACTIVE_MODE:-}"
+        printf 'HOTSPOT_IFACE=%s\n' "${HOTSPOT_IFACE:-}"
+        printf 'HOTSPOT_SSID_ACTIVE=%s\n' "${HOTSPOT_SSID_ACTIVE:-}"
+        if [[ "${EUID}" -eq 0 ]]; then
+            printf 'HOTSPOT_PASS_ACTIVE=%s\n' "${HOTSPOT_PASS_ACTIVE:-}"
+        fi
+        printf 'ACTIVE_CHANNEL=%s\n' "${ACTIVE_CHANNEL:-}"
+        printf 'ACTIVE_FREQ=%s\n' "${ACTIVE_FREQ:-}"
+        printf 'HOTSPOT_GW_ACTIVE=%s\n' "${HOTSPOT_GW_ACTIVE:-}"
+        printf 'HOTSPOT_SUBNET_ACTIVE=%s\n' "${HOTSPOT_SUBNET_ACTIVE:-}"
+        printf 'UPSTREAM_IFACE=%s\n' "${UPSTREAM_IFACE_ACTIVE:-$UPSTREAM_IFACE}"
+        printf 'CONNECTED_CLIENTS=%s\n' "$clients"
+    else
+        local up_if="${UPSTREAM_IFACE:-wlp4s0}"
+        local info="" freq="" ch=""
+        info="$(get_iface_info "$up_if" || true)"
+        if [[ -n "$info" ]]; then
+            read -r freq ch <<< "$(get_upstream_freq_and_channel "$info")" || true
+        fi
+        printf 'HOTSPOT_ACTIVE=0\n'
+        printf 'UPSTREAM_IFACE=%s\n' "$up_if"
+        printf 'UPSTREAM_FREQ=%s\n' "$freq"
+        printf 'UPSTREAM_CHANNEL=%s\n' "$ch"
+    fi
+}
+
+print_status_human() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        if is_hotspot_active; then
+            # shellcheck source=/dev/null
+            source "$PUBLIC_STATE_FILE"
+            local clients
+            clients="$(count_clients "${HOTSPOT_IFACE:-}")"
+            printf 'Status      : ACTIVE\n'
+            printf 'Mode        : %s\n' "${ACTIVE_MODE:-}"
+            printf 'Interface   : %s (upstream: %s)\n' "${HOTSPOT_IFACE:-}" "${UPSTREAM_IFACE_ACTIVE:-wlp4s0}"
+            printf 'SSID        : %s\n' "${HOTSPOT_SSID_ACTIVE:-}"
+            printf 'Channel     : %s (%s MHz)\n' "${ACTIVE_CHANNEL:-}" "${ACTIVE_FREQ:-}"
+            printf 'Gateway IP  : %s\n' "${HOTSPOT_GW_ACTIVE:-}"
+            printf 'Clients     : %s\n' "$clients"
+            printf 'Note        : Run "sudo wifi-hotspot status" to view the active passphrase.\n'
+        else
+            printf 'Status      : INACTIVE\n'
+            printf 'Note        : Run "sudo wifi-hotspot status" for configured defaults.\n'
+        fi
+        return 0
+    fi
+
+    if is_hotspot_active; then
+        # shellcheck source=/dev/null
+        source "$STATE_FILE"
+        local prefix="${HOTSPOT_SUBNET_ACTIVE#*/}"
+        local clients mode_desc pids=""
+        clients="$(count_clients "${HOTSPOT_IFACE:-}")"
+        if [[ "${ACTIVE_MODE:-}" == "ap" ]]; then
+            mode_desc="AP (virtual __ap parallel with ${UPSTREAM_IFACE_ACTIVE:-$UPSTREAM_IFACE})"
+            pids="hostapd=$(cat "$HOSTAPD_PID" 2>/dev/null || printf '?'), dnsmasq=$(cat "$DNSMASQ_PID" 2>/dev/null || printf '?')"
+        else
+            mode_desc="P2P-GO (2.4 GHz multi-channel parallel with ${UPSTREAM_IFACE_ACTIVE:-$UPSTREAM_IFACE})"
+            pids="wpa_supplicant=$(cat "$WPA_PID" 2>/dev/null || printf '?'), dnsmasq=$(cat "$DNSMASQ_PID" 2>/dev/null || printf '?')"
+        fi
+        printf 'Status      : ACTIVE\n'
+        printf 'Mode        : %s\n' "$mode_desc"
+        printf 'Interface   : %s (upstream: %s)\n' "${HOTSPOT_IFACE:-}" "${UPSTREAM_IFACE_ACTIVE:-$UPSTREAM_IFACE}"
+        printf 'SSID        : %s\n' "${HOTSPOT_SSID_ACTIVE:-}"
+        printf 'Password    : %s\n' "${HOTSPOT_PASS_ACTIVE:-}"
+        printf 'Channel     : %s (%s MHz)\n' "${ACTIVE_CHANNEL:-}" "${ACTIVE_FREQ:-}"
+        printf 'Gateway IP  : %s/%s\n' "${HOTSPOT_GW_ACTIVE:-}" "$prefix"
+        printf 'DHCP Range  : %s\n' "${DHCP_RANGE_ACTIVE:-}"
+        printf 'Clients     : %s\n' "$clients"
+        printf 'Daemons     : %s\n' "$pids"
+        printf 'Started At  : %s\n' "${STARTED_AT:-}"
+    else
+        local info="" freq="" ch=""
+        info="$(get_iface_info "$UPSTREAM_IFACE" || true)"
+        if [[ -n "$info" ]]; then
+            read -r freq ch <<< "$(get_upstream_freq_and_channel "$info")" || true
+        fi
+        printf 'Status      : INACTIVE\n'
+        printf 'Config Mode : %s\n' "$HOTSPOT_MODE"
+        if [[ -n "$freq" ]]; then
+            printf 'Upstream    : %s (channel %s, %s MHz)\n' "$UPSTREAM_IFACE" "$ch" "$freq"
+        else
+            printf 'Upstream    : %s (disconnected)\n' "$UPSTREAM_IFACE"
+        fi
+        printf 'Default SSID: %s\n' "$HOTSPOT_SSID"
+    fi
+}
+
+start_hotspot_locked() {
+    local requested_mode="$1"
+    local porcelain="$2"
+
+    local mode="${requested_mode:-$HOTSPOT_MODE}"
+    case "$mode" in
+        auto|ap|p2p) ;;
+        *) die "invalid mode '${mode}' (expected: auto, ap, p2p)." ;;
+    esac
+
+    if is_hotspot_active; then
+        # shellcheck source=/dev/null
+        source "$STATE_FILE"
+        if [[ -n "$requested_mode" && "$requested_mode" != "auto" && "$requested_mode" != "${ACTIVE_MODE:-}" ]]; then
+            die "hotspot is already active in mode '${ACTIVE_MODE:-}'; run 'wifi-hotspot off' first."
+        fi
+        if [[ "$porcelain" -eq 1 ]]; then
+            print_status_porcelain
+        else
+            printf 'Hotspot is already active.\n'
+            print_status_human
+        fi
+        return 0
+    fi
+
+    # Clean up any leftover stale state from an unexpected termination
+    internal_off
+
+    check_wifi_radio
+
+    local info wiphy upstream_freq="" upstream_ch=""
+    info="$(get_iface_info "$UPSTREAM_IFACE")" || die "upstream interface '${UPSTREAM_IFACE}' not found."
+    wiphy="$(get_upstream_wiphy "$info")"
+    [[ -n "$wiphy" ]] || die "failed to determine wiphy for '${UPSTREAM_IFACE}'."
+    read -r upstream_freq upstream_ch <<< "$(get_upstream_freq_and_channel "$info")" || true
+
+    local effective_mode="" target_ch="" target_freq=""
+    if [[ -n "$upstream_freq" ]]; then
+        if (( upstream_freq >= 5000 )); then
+            case "$mode" in
+                auto|p2p)
+                    effective_mode="p2p"
+                    target_freq="$P2P_CHANNEL_FREQ"
+                    ;;
+                ap)
+                    die "upstream ${UPSTREAM_IFACE} is on 5 GHz (${upstream_freq} MHz); phy${wiphy} restricts managed+AP to #channels<=1 and marks 5 GHz passive/NO_IR. Use '--mode auto' or '--mode p2p'."
+                    ;;
+            esac
+        elif (( upstream_freq >= 2412 && upstream_freq <= 2484 )); then
+            case "$mode" in
+                auto|ap)
+                    effective_mode="ap"
+                    target_freq="$upstream_freq"
+                    target_ch="${upstream_ch:-$(freq_to_channel "$upstream_freq")}"
+                    ;;
+                p2p)
+                    effective_mode="p2p"
+                    target_freq="$P2P_CHANNEL_FREQ"
+                    ;;
+            esac
+        else
+            die "unsupported upstream frequency ${upstream_freq} MHz on ${UPSTREAM_IFACE}."
+        fi
+    else
+        # Upstream Wi-Fi interface is not currently associated (e.g., Ethernet upstream)
+        case "$mode" in
+            auto|ap)
+                effective_mode="ap"
+                target_freq="$P2P_CHANNEL_FREQ"
+                target_ch="$(freq_to_channel "$P2P_CHANNEL_FREQ")"
+                ;;
+            p2p)
+                effective_mode="p2p"
+                target_freq="$P2P_CHANNEL_FREQ"
+                ;;
+        esac
+    fi
+
+    rollback_needed=1
+    trap cleanup_on_exit EXIT
+
+    if [[ "$effective_mode" == "ap" ]]; then
+        start_ap_mode "$wiphy" "$target_ch" "$target_freq"
+    else
+        start_p2p_mode "$wiphy" "$target_freq"
+    fi
+
+    configure_network_services
+    write_state_file
+    rollback_needed=0
+
+    if [[ "$porcelain" -eq 1 ]]; then
+        print_status_porcelain
+    else
+        print_status_human
+    fi
+}
+
+cmd_on() {
+    local requested_mode=""
+    local porcelain=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --mode)
+                shift
+                [[ $# -gt 0 ]] || die "--mode requires an argument (auto|ap|p2p)."
+                requested_mode="$1"
+                ;;
+            --mode=*)
+                requested_mode="${1#--mode=}"
+                ;;
+            --porcelain)
+                porcelain=1
+                ;;
+            *)
+                die "unknown option for 'on': $1"
+                ;;
+        esac
+        shift
+    done
+
+    require_root
+    acquire_lock
+    load_config
+    start_hotspot_locked "$requested_mode" "$porcelain"
+}
+
+cmd_off() {
+    local porcelain=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --porcelain) porcelain=1 ;;
+            *) die "unknown option for 'off': $1" ;;
+        esac
+        shift
+    done
+
+    require_root
+    acquire_lock
+    load_config_lenient
+    internal_off
+
+    if [[ "$porcelain" -eq 1 ]]; then
+        print_status_porcelain
+    else
+        printf 'Hotspot stopped cleanly.\n'
+    fi
+}
+
+cmd_toggle() {
+    local requested_mode=""
+    local porcelain=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --porcelain) porcelain=1 ;;
+            --mode)
+                shift
+                [[ $# -gt 0 ]] || die "--mode requires an argument (auto|ap|p2p)."
+                requested_mode="$1"
+                ;;
+            --mode=*)
+                requested_mode="${1#--mode=}"
+                ;;
+            *) die "unknown option for 'toggle': $1" ;;
+        esac
+        shift
+    done
+
+    require_root
+    acquire_lock
+
+    if is_hotspot_active; then
+        load_config_lenient
+        internal_off
+        if [[ "$porcelain" -eq 1 ]]; then
+            print_status_porcelain
+        else
+            printf 'Hotspot stopped cleanly.\n'
+        fi
+    else
+        load_config
+        start_hotspot_locked "$requested_mode" "$porcelain"
+    fi
+}
+
+cmd_status() {
+    local porcelain=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --porcelain) porcelain=1 ;;
+            *) die "unknown option for 'status': $1" ;;
+        esac
+        shift
+    done
+
+    if [[ "${EUID}" -eq 0 ]]; then
+        load_config_lenient
+    fi
+
+    if [[ "$porcelain" -eq 1 ]]; then
+        print_status_porcelain
+    else
+        print_status_human
+    fi
+}
+
+usage() {
+    cat <<'USAGE'
+Usage: wifi-hotspot <command> [options]
+
+Commands:
+  on [--mode auto|ap|p2p] [--porcelain]   Start Hotspot parallel to upstream Wi-Fi
+  off [--porcelain]                       Stop Hotspot and clean up interfaces/NAT
+  toggle [--mode auto|ap|p2p] [--porcelain]
+                                          Toggle Hotspot on/off
+  status [--porcelain]                    Show current Hotspot status
+  help                                    Show this help message
+USAGE
+}
+
+main() {
+    local cmd="${1:-status}"
+    shift || true
+
+    case "$cmd" in
+        on) cmd_on "$@" ;;
+        off) cmd_off "$@" ;;
+        toggle) cmd_toggle "$@" ;;
+        status) cmd_status "$@" ;;
+        help|-h|--help) usage ;;
+        *) die "unknown command '${cmd}'. Run 'wifi-hotspot help'." ;;
+    esac
+}
+
+main "$@"

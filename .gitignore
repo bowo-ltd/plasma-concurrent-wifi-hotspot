@@ -1,0 +1,24 @@
+# Linux / System
+*~
+*.swp
+*.swo
+.DS_Store
+
+# Temporary & State files
+/run/
+*.pid
+*.log
+*.leases
+
+# Local secrets & sensitive configs
+/configs/wifi-hotspot.conf
+/etc/wifi-hotspot.conf
+
+# IDE & Editor caches
+.idea/
+.vscode/
+*.kate-swp
+
+# Qt / QML build artifacts (if compiled)
+*.qmlc
+*.jsc
