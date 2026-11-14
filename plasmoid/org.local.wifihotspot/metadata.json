@@ -1,0 +1,23 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "Local System Config"
+            }
+        ],
+        "Category": "System Information",
+        "Description": "Toggle and monitor parallel Wi-Fi Hotspot (AP / P2P-GO) alongside Wi-Fi",
+        "EnabledByDefault": true,
+        "Icon": "network-wireless-hotspot",
+        "Id": "org.local.wifihotspot",
+        "License": "GPL-2.0-or-later",
+        "Name": "Wi-Fi Hotspot",
+        "Version": "1.0"
+    },
+    "X-Plasma-API": "declarativeappletscript",
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-MainScript": "ui/main.qml",
+    "X-Plasma-NotificationArea": "true",
+    "X-Plasma-NotificationAreaCategory": "SystemServices"
+}
