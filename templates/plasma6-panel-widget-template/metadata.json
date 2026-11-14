@@ -1,0 +1,23 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "{{AUTHOR_NAME}}"
+            }
+        ],
+        "Category": "Utilities",
+        "Description": "{{APPLET_DESCRIPTION}}",
+        "EnabledByDefault": true,
+        "Icon": "{{APPLET_ICON}}",
+        "Id": "{{APPLET_ID}}",
+        "License": "GPL-2.0-or-later",
+        "Name": "{{APPLET_NAME}}",
+        "Version": "1.0.0"
+    },
+    "X-Plasma-API": "declarativeappletscript",
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-MainScript": "ui/main.qml",
+    "X-Plasma-NotificationArea": "true",
+    "X-Plasma-NotificationAreaCategory": "SystemServices"
+}
