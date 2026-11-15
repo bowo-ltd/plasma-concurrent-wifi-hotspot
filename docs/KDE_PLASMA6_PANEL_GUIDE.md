@@ -175,10 +175,24 @@ function runCommand(commandString) {
 }
 ```
 
-### Polling with a Timer:
+### Choosing Event-Driven vs. Periodic Polling:
+
+1. **Zero-Polling Event-Driven Default (Recommended for battery efficiency, used by `templates/plasma6-panel-widget-template` and `org.local.sovereignops`)**:
+   - Refresh only in `Component.onCompleted`, `onExpandedChanged` (when `expanded === true`), and after user actions or explicit refresh clicks.
+   - Gate optional background polling behind `running: root.enableBackgroundPolling` (without `&& root.expanded`, so enabling it actually refreshes the tray icon/badge while collapsed):
 ```qml
 Timer {
-    interval: 5000 // Poll every 5 seconds
+    interval: root.refreshIntervalSec * 1000
+    running: root.enableBackgroundPolling
+    repeat: true
+    onTriggered: root.runCommand("/usr/local/bin/wifi-hotspot status --porcelain");
+}
+```
+
+2. **Adaptive Periodic Polling (Used by `org.local.wifihotspot` for live AP status & client count badge)**:
+```qml
+Timer {
+    interval: root.expanded ? 4000 : 12000 // Faster when popup open, slower when collapsed
     running: true
     repeat: true
     triggeredOnStart: true

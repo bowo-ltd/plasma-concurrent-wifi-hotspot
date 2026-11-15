@@ -71,7 +71,7 @@ flowchart TD
     end
 
     subgraph System_Tier["Root Daemon Tier (/usr/local/bin/wifi-hotspot)"]
-        CLI["wifi-hotspot CLI (1070 lines Bash)"]
+        CLI["wifi-hotspot CLI (1071 lines Bash)"]
         Conf["/etc/wifi-hotspot.conf"]
         State["/run/wifi-hotspot/ (Atomic lock & state)"]
         Rollback["Atomic Rollback Engine"]
@@ -129,7 +129,7 @@ plasma-concurrent-wifi-hotspot/
 │       ├── metadata.json               # Plasma 6 package manifest (declarativeappletscript 6.0)
 │       └── contents/ui/main.qml        # Compact (panel) & Full (popup) Qt 6 Kirigami UI
 ├── scripts/
-│   ├── wifi-hotspot                    # The 1070-line hardened bash concurrency daemon
+│   ├── wifi-hotspot                    # The 1071-line hardened bash concurrency daemon
 │   ├── wifi-hotspot-toggle-ui          # Desktop toggle wrapper with notify-send & pkexec fallback
 │   ├── install.sh                      # Production installer for CLI, configs, desktop & plasmoid
 │   ├── uninstall.sh                    # Clean uninstaller and state teardown
@@ -165,7 +165,7 @@ cd plasma-concurrent-wifi-hotspot
 ```
 
 ### 3. Configuration
-Edit `/etc/wifi-hotspot.conf` to set your desired SSID, passphrase, and upstream interface:
+Edit `/etc/wifi-hotspot.conf` (`install.sh` copies `configs/wifi-hotspot.conf.example` with default `HOTSPOT_SSID="ArchLinux-Hotspot"`; without a config file the script falls back to `ArchHotspot`) to set your desired SSID, passphrase, and upstream interface:
 ```bash
 sudo nano /etc/wifi-hotspot.conf
 ```

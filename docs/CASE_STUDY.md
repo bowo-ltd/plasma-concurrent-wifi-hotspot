@@ -57,7 +57,7 @@ flowchart TD
     end
 
     subgraph RootSpace["System Daemon Tier (Root Privileges)"]
-        CLI["/usr/local/bin/wifi-hotspot (1070 lines Bash)"]
+        CLI["/usr/local/bin/wifi-hotspot (1071 lines Bash)"]
         Conf["/etc/wifi-hotspot.conf"]
         State["/run/wifi-hotspot/ (Atomic lock & state)"]
         

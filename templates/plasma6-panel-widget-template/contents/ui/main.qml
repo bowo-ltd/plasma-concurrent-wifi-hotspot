@@ -83,7 +83,7 @@ PlasmoidItem {
     Timer {
         id: pollTimer
         interval: root.refreshIntervalSec * 1000
-        running: root.enableBackgroundPolling && root.expanded
+        running: root.enableBackgroundPolling
         repeat: true
         onTriggered: {
             // Replace with your real status probe (e.g. CLI command with --json or --porcelain)

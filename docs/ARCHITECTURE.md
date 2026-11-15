@@ -130,8 +130,11 @@ To route client packets between the hotspot subnet (`192.168.12.0/24`) and the u
 
 ### Safety Invariants:
 1. **Zero Collision with Docker / UFW**: Because all rules reside in `table inet wifi_hotspot`, they never conflict with UFW's `ufw-before-input` or Docker's `DOCKER-FORWARD` chains.
-2. **Atomic Destruction**: Deleting the table (`nft delete table inet wifi_hotspot`) atomically unregisters the Netfilter hooks at kernel runtime with zero residue.
-3. **Restoration of Sysctl**: The daemon backs up the prior state of `net.ipv4.ip_forward` in `/run/wifi-hotspot/prev_ip_forward` and restores it faithfully on teardown.
+2. **Coexistence with `systemd-resolved`, Tailscale MagicDNS & NetworkManager**:
+   - The generated `dnsmasq` config specifies `interface=${HOTSPOT_IFACE}`, `listen-address=${HOTSPOT_GW}` (`192.168.12.1`), `bind-interfaces`, and `except-interface=lo`, preventing port 53 bind collisions with `systemd-resolved`'s local stub (`127.0.0.53:53`).
+   - On NetworkManager hosts (such as Arch Linux with `/etc/NetworkManager/conf.d/99-wifi-hotspot-unmanaged.conf` declaring `unmanaged-devices=interface-name:ap0;interface-name:p2p-wlp4s0-*`), NetworkManager ignores the transient virtual AP interface so `hostapd`/`wpa_supplicant` retain exclusive control.
+3. **Atomic Destruction**: Deleting the table (`nft delete table inet wifi_hotspot`) atomically unregisters the Netfilter hooks at kernel runtime with zero residue.
+4. **Restoration of Sysctl**: The daemon backs up the prior state of `net.ipv4.ip_forward` in `/run/wifi-hotspot/prev_ip_forward` and restores it faithfully on teardown.
 
 ---
 
@@ -144,6 +147,8 @@ wifi-hotspot status --porcelain
 ```
 
 ### Porcelain Serialization Format:
+
+**Active state**:
 ```ini
 HOTSPOT_ACTIVE=1
 ACTIVE_MODE=ap
@@ -155,6 +160,14 @@ HOTSPOT_GW_ACTIVE=192.168.12.1
 HOTSPOT_SUBNET_ACTIVE=192.168.12.0/24
 UPSTREAM_IFACE=wlp4s0
 CONNECTED_CLIENTS=1
+```
+
+**Idle state**:
+```ini
+HOTSPOT_ACTIVE=0
+UPSTREAM_IFACE=wlp4s0
+UPSTREAM_FREQ=2422
+UPSTREAM_CHANNEL=3
 ```
 
 ### Parsing Pipeline in Qt 6 QML:
