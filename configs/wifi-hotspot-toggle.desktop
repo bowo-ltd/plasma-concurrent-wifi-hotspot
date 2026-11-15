@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Wi-Fi Hotspot Toggle
+GenericName=Parallel Wi-Fi Hotspot
+Comment=Toggle parallel Wi-Fi Hotspot (AP / P2P-GO) without disconnecting Wi-Fi
+Exec=/usr/local/bin/wifi-hotspot-toggle-ui
+Icon=network-wireless-hotspot
+Terminal=false
+Categories=Network;
+Keywords=wifi;hotspot;ap;tethering;wireless;
+StartupNotify=false

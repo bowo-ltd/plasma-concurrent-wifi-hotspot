@@ -9,10 +9,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 CLI_TARGET="/usr/local/bin/wifi-hotspot"
+UI_HELPER_TARGET="/usr/local/bin/wifi-hotspot-toggle-ui"
 CONF_TARGET="/etc/wifi-hotspot.conf"
 SUDOERS_TARGET="/etc/sudoers.d/wifi-hotspot"
-PLASMOID_SRC="${REPO_ROOT}/plasmoid/org.local.wifihotspot"
-PLASMOID_DEST="${HOME}/.local/share/plasma/plasmoids/org.local.wifihotspot"
+DESKTOP_DIR="${HOME}/.local/share/applications"
+DESKTOP_TARGET="${DESKTOP_DIR}/wifi-hotspot-toggle.desktop"
+PLASMOID_ID="org.local.wifihotspot"
+PLASMOID_SRC="${REPO_ROOT}/plasmoid/${PLASMOID_ID}"
+PLASMOID_DEST="${HOME}/.local/share/plasma/plasmoids/${PLASMOID_ID}"
 
 log() { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
@@ -37,9 +41,10 @@ if [ ${#MISSING[@]} -gt 0 ]; then
     warn "On Debian/Ubuntu: sudo apt install iw iproute2 hostapd wpasupplicant dnsmasq nftables"
 fi
 
-# 2. Install CLI Daemon
-log "Installing ${CLI_TARGET}..."
+# 2. Install CLI Daemon & Desktop Toggle Wrapper
+log "Installing ${CLI_TARGET} and ${UI_HELPER_TARGET}..."
 sudo install -m 0755 "${REPO_ROOT}/scripts/wifi-hotspot" "${CLI_TARGET}"
+sudo install -m 0755 "${REPO_ROOT}/scripts/wifi-hotspot-toggle-ui" "${UI_HELPER_TARGET}"
 
 # 3. Setup Configuration File
 if [ ! -f "${CONF_TARGET}" ]; then
@@ -50,26 +55,43 @@ else
     log "Existing configuration preserved at ${CONF_TARGET}."
 fi
 
-# 4. Setup Sudoers Rule for Passwordless Plasma Polling
+# 4. Setup Sudoers Rule for Passwordless Toggle & Credential Reveal
 if [ ! -f "${SUDOERS_TARGET}" ]; then
-    log "Setting up passwordless sudo rule at ${SUDOERS_TARGET}..."
-    sudo install -m 0440 "${REPO_ROOT}/configs/sudoers-wifi-hotspot.example" "${SUDOERS_TARGET}"
+    if ! command -v visudo >/dev/null 2>&1 || sudo visudo -cf "${REPO_ROOT}/configs/sudoers-wifi-hotspot.example" >/dev/null 2>&1; then
+        log "Setting up passwordless sudo rule at ${SUDOERS_TARGET}..."
+        sudo install -m 0440 "${REPO_ROOT}/configs/sudoers-wifi-hotspot.example" "${SUDOERS_TARGET}"
+    else
+        warn "visudo validation failed on sudoers template; skipping ${SUDOERS_TARGET} (pkexec fallback remains available)."
+    fi
 fi
 
-# 5. Install KDE Plasma 6 Plasmoid
-log "Installing Plasmoid to ${PLASMOID_DEST}..."
-mkdir -p "$(dirname "${PLASMOID_DEST}")"
-rm -rf "${PLASMOID_DEST}"
-cp -a "${PLASMOID_SRC}" "${PLASMOID_DEST}"
+# 5. Install Desktop Launcher Entry
+log "Installing desktop entry at ${DESKTOP_TARGET}..."
+mkdir -p "${DESKTOP_DIR}"
+install -m 0644 "${REPO_ROOT}/configs/wifi-hotspot-toggle.desktop" "${DESKTOP_TARGET}"
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "${DESKTOP_DIR}" 2>/dev/null || true
+fi
 
-# 6. Refresh Plasma Shell (if running)
-if pgrep -x plasmashell >/dev/null 2>&1; then
-    log "Reloading KDE Plasma shell components..."
-    if command -v qdbus6 >/dev/null 2>&1; then
-        qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.refreshCurrentShell 2>/dev/null || true
-    elif command -v qdbus >/dev/null 2>&1; then
-        qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.refreshCurrentShell 2>/dev/null || true
+# 6. Install KDE Plasma 6 Plasmoid
+log "Installing Plasmoid (${PLASMOID_ID})..."
+if command -v kpackagetool6 >/dev/null 2>&1; then
+    if kpackagetool6 -t Plasma/Applet --list 2>/dev/null | grep -qx "${PLASMOID_ID}"; then
+        kpackagetool6 -t Plasma/Applet -u "${PLASMOID_SRC}"
+    else
+        mkdir -p "$(dirname "${PLASMOID_DEST}")"
+        kpackagetool6 -t Plasma/Applet -i "${PLASMOID_SRC}"
     fi
+else
+    mkdir -p "$(dirname "${PLASMOID_DEST}")"
+    rm -rf "${PLASMOID_DEST}"
+    cp -a "${PLASMOID_SRC}" "${PLASMOID_DEST}"
+fi
+
+# 7. Reload Guidance for Plasma Shell
+if pgrep -x plasmashell >/dev/null 2>&1; then
+    warn "If an existing panel widget was updated and does not reflect QML changes, restart Plasma shell with:"
+    echo "  systemctl --user restart plasma-plasmashell.service"
 fi
 
 echo "======================================================================"

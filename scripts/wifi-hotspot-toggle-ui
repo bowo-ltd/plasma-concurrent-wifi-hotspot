@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HOTSPOT_BIN="/usr/local/bin/wifi-hotspot"
+NOTIFY_BIN="/usr/bin/notify-send"
+ICON_NAME="network-wireless-hotspot"
+APP_NAME="Wi-Fi Hotspot"
+
+escape_notify_markup() {
+    local text="$1"
+    text="${text//&/&amp;}"
+    text="${text//</&lt;}"
+    text="${text//>/&gt;}"
+    printf '%s' "$text"
+}
+
+send_notify() {
+    local urgency="$1"
+    local title="$2"
+    local body="$3"
+    if [[ -x "$NOTIFY_BIN" ]]; then
+        local safe_body
+        safe_body="$(escape_notify_markup "$body")"
+        "$NOTIFY_BIN" -u "$urgency" -a "$APP_NAME" -i "$ICON_NAME" "$title" "$safe_body" >/dev/null 2>&1 || true
+    fi
+}
+
+run_privileged_toggle() {
+    if sudo -n -l "$HOTSPOT_BIN" >/dev/null 2>&1; then
+        sudo -n "$HOTSPOT_BIN" toggle "$@" --porcelain 2>&1
+    elif command -v pkexec >/dev/null 2>&1; then
+        pkexec "$HOTSPOT_BIN" toggle "$@" --porcelain 2>&1
+    else
+        printf 'Error: neither passwordless sudo nor pkexec is available.\n'
+        return 1
+    fi
+}
+
+main() {
+    local output="" rc=0
+    output="$(run_privileged_toggle "$@")" || rc=$?
+
+    if [[ "$rc" -ne 0 ]]; then
+        send_notify "critical" "Wi-Fi Hotspot Error" "${output:-Failed to toggle Wi-Fi Hotspot (exit ${rc}).}"
+        printf '%s\n' "$output" >&2
+        exit "$rc"
+    fi
+
+    local active="" mode="" iface="" ssid="" pass="" ch="" freq="" gw="" upstream="wlp4s0"
+    local line key val
+    while IFS= read -r line; do
+        key="${line%%=*}"
+        val="${line#*=}"
+        case "$key" in
+            HOTSPOT_ACTIVE) active="$val" ;;
+            ACTIVE_MODE) mode="$val" ;;
+            HOTSPOT_IFACE) iface="$val" ;;
+            HOTSPOT_SSID_ACTIVE) ssid="$val" ;;
+            HOTSPOT_PASS_ACTIVE) pass="$val" ;;
+            ACTIVE_CHANNEL) ch="$val" ;;
+            ACTIVE_FREQ) freq="$val" ;;
+            HOTSPOT_GW_ACTIVE) gw="$val" ;;
+            UPSTREAM_IFACE) upstream="$val" ;;
+        esac
+    done <<< "$output"
+
+    if [[ "$active" == "1" ]]; then
+        local mode_label="AP"
+        [[ "$mode" == "p2p" ]] && mode_label="P2P-GO"
+        local title="Wi-Fi Hotspot ON (${mode_label})"
+        local body
+        body=$(printf 'SSID: %s\nPassword: %s\nChannel: %s (%s MHz) on %s\nGateway: %s' \
+            "$ssid" "$pass" "$ch" "$freq" "$iface" "$gw")
+        send_notify "normal" "$title" "$body"
+        printf '%s\n%s\n' "$title" "$body"
+    else
+        local title="Wi-Fi Hotspot OFF"
+        local body="Hotspot disabled cleanly. ${upstream} remains untouched."
+        send_notify "normal" "$title" "$body"
+        printf '%s\n%s\n' "$title" "$body"
+    fi
+}
+
+main "$@"

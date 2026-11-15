@@ -54,7 +54,7 @@ PlasmoidItem {
         if (root.hotspotActive) {
             return "network-wireless-hotspot";
         }
-        return root.inPanel ? "hotspot-symbolic" : "network-wireless-hotspot-symbolic";
+        return "network-wireless-hotspot-symbolic";
     }
 
     toolTipMainText: root.hotspotActive
@@ -208,7 +208,7 @@ PlasmoidItem {
             if (exitCode === 0) {
                 root.parsePorcelain(data["stdout"] || "", true);
             } else {
-                root.errorMessage = "Run 'sudo wifi-hotspot status' in terminal or check sudo privileges to reveal password.";
+                root.errorMessage = "Run 'sudo wifi-hotspot status' in a terminal or deploy /etc/sudoers.d/wifi-hotspot to reveal password without prompting (pkexec is used for toggle fallback).";
             }
         }
     }
@@ -256,7 +256,7 @@ PlasmoidItem {
                 spacing: Kirigami.Units.smallSpacing
 
                 Kirigami.Icon {
-                    source: root.hotspotActive ? "network-wireless-hotspot" : "hotspot-symbolic"
+                    source: root.hotspotActive ? "network-wireless-hotspot" : "network-wireless-hotspot-symbolic"
                     Layout.preferredWidth: Kirigami.Units.iconSizes.medium
                     Layout.preferredHeight: Kirigami.Units.iconSizes.medium
                 }
@@ -374,11 +374,11 @@ PlasmoidItem {
                         text: {
                             if (root.upstreamFreq !== "") {
                                 const is5 = Number(root.upstreamFreq) >= 5000;
-                                return "Upstream " + root.upstreamIface + " terhubung di Ch " + root.upstreamChannel
-                                    + " (" + root.upstreamFreq + " MHz). Mode Auto akan memakai "
-                                    + (is5 ? "P2P-GO (2.4 GHz)" : "Virtual AP (channel sama)") + " tanpa memutus Wi-Fi.";
+                                return "Upstream " + root.upstreamIface + " connected on Ch " + root.upstreamChannel
+                                    + " (" + root.upstreamFreq + " MHz). Auto mode will use "
+                                    + (is5 ? "P2P-GO (2.4 GHz)" : "Virtual AP (same channel)") + " without dropping Wi-Fi.";
                             }
-                            return "Upstream " + root.upstreamIface + " siap menjalankan Hotspot paralel tanpa memutus koneksi utama.";
+                            return "Upstream " + root.upstreamIface + " is ready to run a parallel Hotspot without disconnecting primary Wi-Fi.";
                         }
                         opacity: 0.85
                     }
@@ -399,7 +399,7 @@ PlasmoidItem {
                         }
 
                         PlasmaComponents3.RadioButton {
-                            text: "Force AP (2.4 GHz sama channel)"
+                            text: "Force AP (2.4 GHz same channel)"
                             checked: root.selectedMode === "ap"
                             onToggled: if (checked) root.selectedMode = "ap"
                         }

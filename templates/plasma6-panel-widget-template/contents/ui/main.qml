@@ -25,6 +25,7 @@ PlasmoidItem {
     property bool isBusy: false
     property string statusText: "Ready"
     property string lastOutput: ""
+    property bool enableBackgroundPolling: false
     property int refreshIntervalSec: 5
 
     // --- Panel Location Helper ---
@@ -73,13 +74,17 @@ PlasmoidItem {
         execEngine.connectSource(cmd);
     }
 
-    // Periodic Polling Timer
+    // Refresh Mode:
+    // - Zero-polling default (recommended for battery/CPU efficiency): refreshes on init, popup open, and manual clicks.
+    // - Optional background polling: set enableBackgroundPolling = true when live tray badge updates are required.
+    Component.onCompleted: runCommand("uptime -p")
+    onExpandedChanged: if (expanded) runCommand("uptime -p")
+
     Timer {
         id: pollTimer
         interval: root.refreshIntervalSec * 1000
-        running: true
+        running: root.enableBackgroundPolling && root.expanded
         repeat: true
-        triggeredOnStart: true
         onTriggered: {
             // Replace with your real status probe (e.g. CLI command with --json or --porcelain)
             runCommand("uptime -p");
