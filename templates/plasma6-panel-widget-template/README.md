@@ -44,9 +44,11 @@ You can use the automated generator script in `scripts/create-plasma-widget.sh`:
    ```bash
    cp -r my-plasmoid ~/.local/share/plasma/plasmoids/org.custom.myservice
    ```
-3. **Live Reload Plasma Shell**:
+3. **Upgrade Existing Package / Reload Plasma Shell**:
    ```bash
-   qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.refreshCurrentShell
+   kpackagetool6 -t Plasma/Applet -u my-plasmoid
+   # If panel instances do not reload QML cleanly, restart Plasma shell:
+   systemctl --user restart plasma-plasmashell.service
    ```
 4. **Inspect Live QML Logs**:
    ```bash

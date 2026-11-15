@@ -210,12 +210,15 @@ plasmawindowed org.local.mywidget
 ```
 *Benefits:* If your QML has syntax errors, only the test window closes; your desktop and taskbar remain completely unaffected!
 
-### Step 3: Hot-Reload KDE Plasma Shell
-When you make changes to `main.qml` or `metadata.json` and want to see them live on your actual panel:
+### Step 3: Upgrade Package & Reload KDE Plasma Shell
+When you make changes to `main.qml` or `metadata.json` and want to update your installed package or see changes on your actual panel:
 
 ```bash
-# Reload all active Plasma shell components instantly
-qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.refreshCurrentShell
+# Update an installed plasmoid package via kpackagetool6 (when installed as a package)
+kpackagetool6 -t Plasma/Applet -u ~/.local/share/plasma/plasmoids/org.local.mywidget
+
+# Reload Plasma Shell so panel instances pick up updated QML components
+systemctl --user restart plasma-plasmashell.service
 ```
 
 ### Step 4: Inspect Live QML Console & Error Logs

@@ -68,7 +68,7 @@ flowchart TD
             Hostapd["hostapd (Virtual AP __ap)"]
             WpaSupp["wpa_supplicant (P2P-GO Wi-Fi Direct)"]
             Dnsmasq["dnsmasq (Isolated DHCP/DNS Server)"]
-            NFT["nftables (table ip wifi_hotspot)"]
+            NFT["nftables (table inet wifi_hotspot)"]
         end
         
         CLI --> Hostapd
@@ -99,14 +99,14 @@ The daemon (`/usr/local/bin/wifi-hotspot`) dynamically detects upstream channel 
 ### 2. Zero-Pollution Nftables NAT Engine
 Unlike legacy tools that pollute the global `iptables` ruleset and interfere with Docker or UFW, this architecture isolates all firewall rules in an ephemeral table:
 ```bash
-nft add table ip wifi_hotspot
-nft add chain ip wifi_hotspot nat_postrouting '{ type nat hook postrouting priority srcnat; }'
-nft add rule ip wifi_hotspot nat_postrouting oifname "$UPSTREAM_IFACE" ip saddr "$HOTSPOT_SUBNET" counter masquerade
-nft add chain ip wifi_hotspot filter_forward '{ type filter hook forward priority filter; }'
-nft add rule ip wifi_hotspot filter_forward ct state established,related accept
-nft add rule ip wifi_hotspot filter_forward iifname "$HOTSPOT_IFACE" oifname "$UPSTREAM_IFACE" accept
+nft add table inet wifi_hotspot
+nft add chain inet wifi_hotspot forward '{ type filter hook forward priority filter; policy accept; }'
+nft add rule inet wifi_hotspot forward iifname "$HOTSPOT_IFACE" accept
+nft add rule inet wifi_hotspot forward oifname "$HOTSPOT_IFACE" ct state established,related accept
+nft add chain inet wifi_hotspot postrouting '{ type nat hook postrouting priority srcnat; policy accept; }'
+nft add rule inet wifi_hotspot postrouting ip saddr "$HOTSPOT_SUBNET" oifname != "$HOTSPOT_IFACE" masquerade
 ```
-On `wifi-hotspot off`, the entire table `ip wifi_hotspot` is atomically flushed and deleted in a single kernel transaction (`nft delete table ip wifi_hotspot`), leaving system routing completely untainted.
+On `wifi-hotspot off`, the entire table `inet wifi_hotspot` is atomically flushed and deleted in a single kernel transaction (`nft delete table inet wifi_hotspot`), leaving system routing completely untainted.
 
 ### 3. Native KDE Plasma 6 Panel Applet
 An unprivileged Qt 6 QML Plasmoid (`org.local.wifihotspot`) runs directly inside `plasmashell`:
@@ -127,7 +127,7 @@ Measurements taken on Arch Linux (Kernel `6.17.x-arch`, Intel Wireless AX200 / `
 | **Teardown Latency** | 4.5s (dirty state) | **0.88s (clean atomic rollback)** | **~5x faster** |
 | **RAM Footprint (Daemon)** | ~45 MB (Python/GTK GUI) | **0.0 MB** (CLI daemon is event-driven; exits immediately) | **100% saved (0 MB daemon idle)** |
 | **Subsystem Memory** | ~60 MB | `dnsmasq` (`4.2 MB`) + `hostapd` (`6.1 MB`) | **~10.3 MB total runtime** |
-| **Firewall Impact** | Injected iptables rules, broke Docker | **Zero collision** (`table ip wifi_hotspot` isolated) | **100% isolated** |
+| **Firewall Impact** | Injected iptables rules, broke Docker | **Zero collision** (`table inet wifi_hotspot` isolated) | **100% isolated** |
 | **Client Throughput** | N/A (failed) | **84.2 Mbps downlink / 62.4 Mbps uplink** | Full 2.4 GHz 802.11n throughput |
 | **Ping Latency (Client to GW)**| N/A | **1.8ms – 3.2ms** | Low-latency local switching |
 

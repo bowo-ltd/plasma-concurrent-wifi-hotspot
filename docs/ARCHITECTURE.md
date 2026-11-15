@@ -42,7 +42,7 @@ graph TD
     subgraph Network_Tier["5. Networking & Netfilter NAT"]
         L["dnsmasq (DHCP 192.168.12.50-150 + DNS Resolver)"]
         M["sysctl net.ipv4.ip_forward = 1"]
-        N["nftables (table ip wifi_hotspot)"]
+        N["nftables (table inet wifi_hotspot)"]
         H --> L
         H --> M
         H --> N
@@ -107,16 +107,16 @@ To route client packets between the hotspot subnet (`192.168.12.0/24`) and the u
 ┌─────────────────────────────────────────────────────────────┐
 │                    nftables Architecture                    │
 │                                                             │
-│  table ip wifi_hotspot {                                    │
-│    chain filter_forward {                                   │
-│      type filter hook forward priority filter; policy drop; │
-│      ct state established,related accept;                   │
-│      iifname "ap0" oifname "wlp4s0" accept;                 │
+│  table inet wifi_hotspot {                                  │
+│    chain forward {                                          │
+│      type filter hook forward priority filter; policy accept; │
+│      iifname "ap0" accept;                                  │
+│      oifname "ap0" ct state established,related accept;     │
 │    }                                                        │
 │                                                             │
-│    chain nat_postrouting {                                  │
-│      type nat hook postrouting priority srcnat;             │
-│      oifname "wlp4s0" ip saddr 192.168.12.0/24 masquerade;  │
+│    chain postrouting {                                      │
+│      type nat hook postrouting priority srcnat; policy accept; │
+│      ip saddr 192.168.12.0/24 oifname != "ap0" masquerade;  │
 │    }                                                        │
 │  }                                                          │
 └─────────────────────────────────────────────────────────────┘
@@ -129,8 +129,8 @@ To route client packets between the hotspot subnet (`192.168.12.0/24`) and the u
 ```
 
 ### Safety Invariants:
-1. **Zero Collision with Docker / UFW**: Because all rules reside in `table ip wifi_hotspot`, they never conflict with UFW's `ufw-before-input` or Docker's `DOCKER-FORWARD` chains.
-2. **Atomic Destruction**: Deleting the table (`nft delete table ip wifi_hotspot`) atomically unregisters the Netfilter hooks at kernel runtime with zero residue.
+1. **Zero Collision with Docker / UFW**: Because all rules reside in `table inet wifi_hotspot`, they never conflict with UFW's `ufw-before-input` or Docker's `DOCKER-FORWARD` chains.
+2. **Atomic Destruction**: Deleting the table (`nft delete table inet wifi_hotspot`) atomically unregisters the Netfilter hooks at kernel runtime with zero residue.
 3. **Restoration of Sysctl**: The daemon backs up the prior state of `net.ipv4.ip_forward` in `/run/wifi-hotspot/prev_ip_forward` and restores it faithfully on teardown.
 
 ---

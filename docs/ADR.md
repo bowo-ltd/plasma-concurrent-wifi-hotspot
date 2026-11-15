@@ -29,7 +29,7 @@ The KDE Plasma 6 QML applet needs to query daemon state and trigger `on`/`off` m
 2. Using Qt 6 QML's `Plasma5Support.DataSource` with the built-in `executable` data engine.
 
 ### Decision:
-Adopt `Plasma5Support.DataSource` (`engine: "executable"`) coupled with a strict least-privilege `sudoers` rule (`/etc/sudoers.d/wifi-hotspot`).
+Adopt `Plasma5Support.DataSource` (`engine: "executable"`) coupled with a strict least-privilege `sudoers` rule (`/etc/sudoers.d/wifi-hotspot`, supporting `%wheel` and `%sudo`) and `wifi-hotspot-toggle-ui` (`pkexec` + `notify-send` fallback).
 
 ### Consequences:
 - **Positive**:
@@ -46,12 +46,12 @@ Adopt `Plasma5Support.DataSource` (`engine: "executable"`) coupled with a strict
 Enabling NAT masquerade and packet forwarding on Linux typically involves adding rules to `iptables -t nat -A POSTROUTING` and `iptables -A FORWARD`. On developer machines running Docker, Libvirt/KVM, or UFW, modifying legacy iptables frequently breaks container networking or triggers firewall lockouts.
 
 ### Decision:
-Isolate all hotspot packet filtering and NAT masquerading into an independent, ephemeral Netfilter table: `table ip wifi_hotspot`.
+Isolate all hotspot packet filtering and NAT masquerading into an independent, ephemeral Netfilter table: `table inet wifi_hotspot`.
 
 ### Consequences:
 - **Positive**:
   - Total isolation: zero interaction or collision with UFW, Docker, or Tailscale rules.
-  - Atomic cleanup: `nft delete table ip wifi_hotspot` removes all chains and rules in a single atomic kernel transaction on daemon teardown.
+  - Atomic cleanup: `nft delete table inet wifi_hotspot` removes all chains and rules in a single atomic kernel transaction on daemon teardown.
 - **Negative**: Requires modern kernel (>= 5.x) with `nftables` utility installed.
 
 ---

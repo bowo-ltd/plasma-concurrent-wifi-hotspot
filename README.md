@@ -29,7 +29,7 @@ On standard Linux laptops and desktop systems, the primary wireless NIC (`wlan0`
 ### The Solution:
 This project delivers a **hardened, multi-channel concurrent Wi-Fi hotspot daemon** paired with an **unprivileged, native KDE Plasma 6 QML panel widget (Plasmoid)**:
 - **Automatic Concurrency Triage**: Probes `nl80211` virtual interface combinations; dynamically establishes a virtual Access Point (`__ap`) on the upstream carrier frequency, or transitions to `wpa_supplicant` Wi-Fi Direct (`P2P-GO`) multi-channel concurrency.
-- **Zero-Pollution Nftables NAT**: Isolates all packet filtering, forwarding, and masquerading within a dedicated ephemeral table (`table ip wifi_hotspot`), leaving Docker, UFW, and system routing completely untouched.
+- **Zero-Pollution Nftables NAT**: Isolates all packet filtering, forwarding, and masquerading within a dedicated ephemeral table (`table inet wifi_hotspot`), leaving Docker, UFW, and system routing completely untouched.
 - **Native KDE Plasma 6 Desktop Integration**: Unprivileged Qt 6 QML Plasmoid docked in the panel or system tray with real-time client counter, frequency/channel display, secure credential reveal, and toggle switch.
 - **Independent Plasma 6 Applet Generator**: Includes a production-grade template boilerplate and interactive generator script (`scripts/create-plasma-widget.sh`) so developers can build any custom KDE Plasma 6 panel widget in minutes.
 
@@ -46,7 +46,7 @@ This project delivers a **hardened, multi-channel concurrent Wi-Fi hotspot daemo
 | **Teardown Latency** | 4.5s (dirty state) | **0.88s (clean atomic rollback)** | **~5x faster** |
 | **Daemon RAM Footprint** | ~45 MB (Python/GTK GUI) | **0.0 MB** (event-driven CLI exits immediately) | **100% saved (0 MB daemon idle)** |
 | **Subsystem Memory** | ~60 MB | `dnsmasq` (`4.2 MB`) + `hostapd` (`6.1 MB`) | **~10.3 MB total runtime** |
-| **Firewall Collision** | Injected iptables rules, broke Docker | **Zero collision** (`table ip wifi_hotspot` isolated) | **100% isolated** |
+| **Firewall Collision** | Injected iptables rules, broke Docker | **Zero collision** (`table inet wifi_hotspot` isolated) | **100% isolated** |
 | **Client Throughput** | N/A (failed) | **84.2 Mbps downlink / 62.4 Mbps uplink** | Full 802.11n throughput |
 | **Client-to-Gateway Ping** | N/A | **1.8ms – 3.2ms** | Low-latency local switching |
 
@@ -84,7 +84,7 @@ flowchart TD
             Hostapd["hostapd (Virtual AP __ap)"]
             WpaSupp["wpa_supplicant (P2P-GO)"]
             Dnsmasq["dnsmasq (DHCP & DNS)"]
-            NFT["nftables (table ip wifi_hotspot)"]
+            NFT["nftables (table inet wifi_hotspot)"]
         end
         
         Rollback --> Hostapd
@@ -117,7 +117,8 @@ plasma-concurrent-wifi-hotspot/
 ├── README.md                           # Executive Presentation Tier & Documentation Portal
 ├── configs/
 │   ├── wifi-hotspot.conf.example       # Production daemon configuration template
-│   └── sudoers-wifi-hotspot.example    # Least-privilege passwordless sudoers rule
+│   ├── sudoers-wifi-hotspot.example    # Least-privilege passwordless sudoers rule (%wheel & %sudo)
+│   └── wifi-hotspot-toggle.desktop     # Desktop launcher entry for toggle notifications
 ├── docs/                               # Technical Deep-Dive Tier
 │   ├── CASE_STUDY.md                   # Real incident triage, concurrency matrix & benchmarks
 │   ├── ARCHITECTURE.md                 # 802.11 concurrency state machine & nftables packet flow
@@ -129,7 +130,8 @@ plasma-concurrent-wifi-hotspot/
 │       └── contents/ui/main.qml        # Compact (panel) & Full (popup) Qt 6 Kirigami UI
 ├── scripts/
 │   ├── wifi-hotspot                    # The 1070-line hardened bash concurrency daemon
-│   ├── install.sh                      # Production installer for CLI, configs, and plasmoid
+│   ├── wifi-hotspot-toggle-ui          # Desktop toggle wrapper with notify-send & pkexec fallback
+│   ├── install.sh                      # Production installer for CLI, configs, desktop & plasmoid
 │   ├── uninstall.sh                    # Clean uninstaller and state teardown
 │   └── create-plasma-widget.sh         # Interactive generator for scaffolding new Plasma 6 applets
 └── templates/
@@ -192,8 +194,9 @@ This repository includes a standalone generator:
 # Test immediately in an isolated test window
 plasmawindowed org.custom.myservice
 
-# Live-reload Plasma shell without restarting your PC
-qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.refreshCurrentShell
+# Upgrade an installed widget package and restart Plasma Shell if needed
+kpackagetool6 -t Plasma/Applet -u ~/.local/share/plasma/plasmoids/org.custom.myservice
+systemctl --user restart plasma-plasmashell.service
 ```
 
 For the complete end-to-end guide on Qt 6 QML, PlasmoidItem geometry, and running backend shell commands from QML, read [`docs/KDE_PLASMA6_PANEL_GUIDE.md`](docs/KDE_PLASMA6_PANEL_GUIDE.md).
